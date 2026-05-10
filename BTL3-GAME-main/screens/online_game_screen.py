@@ -15,16 +15,47 @@ import pygame
 import time
 from typing import Optional
 
-from screens.game_screen import GameScreen
+from screens.game_screen import GameScreen, DamageText
 from utils.network_client import NetworkClient
 from utils.assets import safe_load_image, resource_path
 
 
 # ─── Hằng số ───────────────────────────────────────────────────────────────
-SEND_INTERVAL = 2          # Gửi state mỗi N frame (60fps / 2 = 30 lần/giây)
+SEND_INTERVAL = 1          # Gửi state mỗi frame (60fps = 60 lần/giây, đồng bộ nhanh nhất)
 CHECKPOINT_RADIUS = 48     # Pixel radius quanh checkpoint trigger
 MAP_ADVANCE_TILES  = 20    # Số tile map mở rộng thêm mỗi lần unlock
 PARTNER_ALPHA      = 200   # Độ mờ của sprite partner
+
+
+# ─── Damage text cho partner (màu cam, phân biệt với đỏ của local) ──────────
+class PartnerDamageText(pygame.sprite.Sprite):
+    """Damage text hiển thị thiệt hại của partner (màu cam)."""
+
+    def __init__(self, damage_amount: int, world_x: float, world_y: float, font: pygame.font.Font):
+        super().__init__()
+        self.damage_amount = damage_amount
+        self.font = font
+        self.x = float(world_x)
+        self.y = float(world_y)
+        self.lifetime = 60
+        self.age = 0
+        self.vy = -1.5
+        self._update_image()
+
+    def _update_image(self):
+        alpha = max(0, 255 - int(self.age * 255 / self.lifetime))
+        text_surf = self.font.render(f"-{self.damage_amount}", True, (255, 140, 0))  # màu cam
+        self.image = pygame.Surface(text_surf.get_size(), pygame.SRCALPHA)
+        text_surf.set_alpha(alpha)
+        self.image.blit(text_surf, (0, 0))
+        self.rect = self.image.get_rect(center=(int(self.x), int(self.y)))
+
+    def update(self):
+        self.age += 1
+        self.y += self.vy
+        self._update_image()
+        if self.age >= self.lifetime:
+            self.kill()
 
 
 # ─── Sprite partner ────────────────────────────────────────────────────────
@@ -215,6 +246,9 @@ class OnlineGameScreen(GameScreen):
         # khi event collect_sword từ partner chưa kịp xóa sprite
         self._collected_sword_ids: set = set()
 
+        # ── Partner damage text (màu cam, world coords) ───
+        self.partner_damage_text_group = pygame.sprite.Group()
+
     # ─────────────────────────────────────────────────────
     # Setup helpers
     # ─────────────────────────────────────────────────────
@@ -343,8 +377,9 @@ class OnlineGameScreen(GameScreen):
             self.partner.update_screen_pos(self.camera_x, self.camera_y)
 
             # ── Partner timeout (disconnected) ────────────
-            if time.time() - self.partner.last_update > 10.0 and not self.partner_disconnected:
-                self._add_notification("⚠ Partner mất kết nối!", (255, 120, 60), ttl=300)
+            # Chỉ đánh dấu disconnected sau 30s không nhận bất kỳ data nào từ partner
+            if time.time() - self.client.get_partner_last_recv() > 30.0 and not self.partner_disconnected:
+                self.partner_disconnected = True
 
             # ── Draw ─────────────────────────────────────
             self._draw_online()
@@ -467,8 +502,10 @@ class OnlineGameScreen(GameScreen):
         # Damage / heal effects
         self.damage_text_group.update()
         self.heal_effect_group.update()
+        self.partner_damage_text_group.update()
 
         # Player collisions
+        self._check_stomp_skeletons()
         self._check_player_enemy_collision()
         self._check_player_item_collision()
         self._check_lava_collision()
@@ -606,6 +643,15 @@ class OnlineGameScreen(GameScreen):
                     self.partner.is_attacking = True
                     self.partner.attack_timer = 20   # 20 frame = ~0.33s ở 60fps
 
+                elif pev == "player_damaged":
+                    # Partner bị thương → hiện damage text màu cam tại vị trí partner
+                    amount = int(data.get("amount", 0))
+                    wx = float(data.get("x", self.partner.world_x + self.partner.rect.width // 2))
+                    wy = float(data.get("y", self.partner.world_y))
+                    if amount > 0:
+                        pdt = PartnerDamageText(amount, wx, wy, self.ui_font)
+                        self.partner_damage_text_group.add(pdt)
+
                 elif pev == "collect_coin":
                     self._remove_nearest_object(self.coin_group, data.get("x", 0), data.get("y", 0))
                     self._add_notification(f"🪙 {self.partner.name} nhặt xu!", (255, 230, 100))
@@ -630,11 +676,14 @@ class OnlineGameScreen(GameScreen):
                 elif pev == "kill_enemy":
                     spawn_x = data.get("spawn_x")
                     if spawn_x is not None:
-                        # Tìm đúng con quái theo spawn_x (ID ổn định, không đổi khi di chuyển)
+                        # Tìm đúng quái theo spawn_x (ID ổn định, không đổi khi di chuyển)
                         for skel in list(self.skeleton_group):
                             if int(skel.start_x) == int(spawn_x):
                                 skel.kill()
-                                self.score += 150
+                                break
+                        for boss in list(self.boss_group):
+                            if int(boss.start_x) == int(spawn_x):
+                                boss.kill()
                                 break
                     else:
                         # Fallback cho event cũ dùng x/y
@@ -643,14 +692,15 @@ class OnlineGameScreen(GameScreen):
                             data.get("x", 0), data.get("y", 0),
                             threshold=300
                         )
-                    self._add_notification(f"⚔ {self.partner.name} tiêu diệt quái!", (255, 200, 60))
+                        self._remove_nearest_object(
+                            self.boss_group,
+                            data.get("x", 0), data.get("y", 0),
+                            threshold=300
+                        )
+                    self._add_notification(f"{self.partner.name} tiêu diệt quái!", (255, 200, 60))
 
                 elif pev == "died":
                     self._game_over = True
-                    self._game_over_reason = f"💀 {self.partner.name} đã chết!\nGAME OVER"
-
-                elif pev == "respawn":
-                    self._add_notification(f"♻ {self.partner.name} đã hồi sinh!", (80, 220, 80))
 
             elif ev_type == "partner_joined":
                 pname = ev.get("name", "Partner")
@@ -663,17 +713,40 @@ class OnlineGameScreen(GameScreen):
         Dùng start_x (vị trí spawn cố định) làm ID ổn định để máy kia
         tìm đúng con quái cần xóa, bất kể nó đang đi tuần ở đâu.
         """
-        # Snapshot: python-id -> spawn_x (bất biến suốt vòng đời skeleton)
+        # Snapshot: python-id -> spawn_x (bất biến suốt vòng đời skeleton/boss)
         alive_snapshot = {
             id(s): int(s.start_x)
             for s in self.skeleton_group
             if s.health > 0
         }
+        boss_snapshot = {
+            id(b): int(b.start_x)
+            for b in self.boss_group
+            if b.hits < b.max_hits
+        }
 
-        # Gọi logic gốc (kill() các skeleton chết, trừ chúng khỏi group)
+        # Gọi logic gốc (kill() các skeleton/boss chết, trừ chúng khỏi group)
         super()._attack_enemies()
 
         # So sánh group trước/sau → gửi event cho mỗi con vừa bị kill
+        alive_after_ids = {id(s) for s in self.skeleton_group}
+        for skel_id, spawn_x in alive_snapshot.items():
+            if skel_id not in alive_after_ids:
+                self.client.send_event("kill_enemy", {"spawn_x": spawn_x})
+
+        boss_after_ids = {id(b) for b in self.boss_group}
+        for boss_id, spawn_x in boss_snapshot.items():
+            if boss_id not in boss_after_ids:
+                self.client.send_event("kill_enemy", {"spawn_x": spawn_x})
+
+    def _check_stomp_skeletons(self):
+        """Override để gửi kill_enemy event khi stomp chết skeleton."""
+        alive_snapshot = {
+            id(s): int(s.start_x)
+            for s in self.skeleton_group
+            if s.health > 0
+        }
+        super()._check_stomp_skeletons()
         alive_after_ids = {id(s) for s in self.skeleton_group}
         for skel_id, spawn_x in alive_snapshot.items():
             if skel_id not in alive_after_ids:
@@ -705,23 +778,25 @@ class OnlineGameScreen(GameScreen):
         # Vẽ partner
         self._draw_partner()
 
-        # Vẽ checkpoint zones
-        self._draw_checkpoints()
+        # Checkpoint zones KHÔNG hiển thị trong online (ẩn đi)
+        # self._draw_checkpoints()
 
         # Vẽ local player (sprite)
         self._draw_local_player()
 
-        # Vẽ effects
+        # Vẽ effects (local player: đỏ | partner: cam)
         for spr in self.damage_text_group:
             self.screen.blit(spr.image, (spr.rect.x - int(self.camera_x), spr.rect.y - int(self.camera_y)))
         for spr in self.heal_effect_group:
+            self.screen.blit(spr.image, (spr.rect.x - int(self.camera_x), spr.rect.y - int(self.camera_y)))
+        for spr in self.partner_damage_text_group:
             self.screen.blit(spr.image, (spr.rect.x - int(self.camera_x), spr.rect.y - int(self.camera_y)))
 
         # HUD 2 người
         self._draw_dual_hud()
 
-        # Notifications
-        self._draw_notifications()
+        # Notifications KHÔNG hiển thị trong online (ẩn đi)
+        # self._draw_notifications()
 
         # Waiting overlay
         if self.partner_disconnected and not self.client.partner_joined:
@@ -732,8 +807,8 @@ class OnlineGameScreen(GameScreen):
         cam = (int(self.camera_x), int(self.camera_y))
 
         for group in [self.coin_group, self.sword_group, self.box_group,
-                      self.star_group, self.key_group,
-                      self.skeleton_group, self.boss_group, self.bullet_group]:
+            self.star_group, self.key_group,
+            self.skeleton_group, self.boss_group, self.bullet_group]:
             for spr in group:
                 sx = spr.rect.x - cam[0]
                 sy = spr.rect.y - cam[1]
@@ -819,20 +894,11 @@ class OnlineGameScreen(GameScreen):
         score2 = self.hud2_font.render(f"Score: {p2_score}", True, (180, 220, 255))
         self.screen.blit(score2, (bar_x, 58))
 
-        # ── Checkpoint indicator (top-center) ────────────
-        if self.current_checkpoint_idx < len(self.checkpoint_zones):
-            zone = self.checkpoint_zones[self.current_checkpoint_idx]
-            p1_mark = "✓" if zone.player_inside else "○"
-            p2_mark = "✓" if zone.partner_inside else "○"
-            status_txt = f"Checkpoint: {p1_mark}P1  {p2_mark}P2"
-            c_col = (80, 255, 80) if (zone.player_inside and zone.partner_inside) \
-                    else (255, 200, 60) if (zone.player_inside or zone.partner_inside) \
-                    else (180, 180, 200)
-            csurf = self.hud2_font.render(status_txt, True, c_col)
-            self.screen.blit(csurf, (self.window_width // 2 - csurf.get_width() // 2, 12))
+        # ── Checkpoint indicator KHÔNG hiển thị trong online ────────
+        # (ẩn để giảm thông tin nhiễu)
 
     def _draw_health_bar(self, x: int, y: int, health: int, max_health: int,
-                         name: str, color: tuple):
+                        name: str, color: tuple):
         bar_w, bar_h = 200, 16
         ratio = max(0.0, health / max_health)
 
@@ -875,37 +941,84 @@ class OnlineGameScreen(GameScreen):
     #    self.screen.blit(msg3, (cx - msg3.get_width() // 2, cy + 50))
 
     def _draw_game_over(self):
-        overlay = pygame.Surface((self.window_width, self.window_height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 200))
+        """Draw game over screen cho chế độ online 2 người."""
+        # Vẽ nền parallax
+        self._draw_parallax_background()
+
+        # Overlay mờ
+        overlay = pygame.Surface((self.window_width, self.window_height))
+        overlay.set_alpha(185)
+        overlay.fill((0, 0, 0))
         self.screen.blit(overlay, (0, 0))
 
         cx = self.window_width // 2
         cy = self.window_height // 2
 
-        # Tiêu đề GAME OVER
+        # ── Tiêu đề GAME OVER ──────────────────────────────────────────
         try:
             big_font = pygame.font.SysFont("arial", 64, bold=True)
+            med_font = pygame.font.SysFont("arial", 30, bold=True)
+            sml_font = pygame.font.SysFont("arial", 22)
         except Exception:
             big_font = pygame.font.Font(None, 64)
+            med_font = pygame.font.Font(None, 30)
+            sml_font = pygame.font.Font(None, 22)
 
-        title = big_font.render("GAME OVER", True, (220, 50, 50))
-        self.screen.blit(title, (cx - title.get_width() // 2, cy - 80))
+        # Shadow + title
+        shadow = big_font.render("GAME OVER", True, (80, 0, 0))
+        title  = big_font.render("GAME OVER", True, (230, 50, 50))
+        self.screen.blit(shadow, (cx - shadow.get_width() // 2 + 3, cy - 110 + 3))
+        self.screen.blit(title,  (cx - title.get_width()  // 2,     cy - 110))
 
-        # Lý do
-        lines = self._game_over_reason.split("\n")
-        for i, line in enumerate(lines):
-            if not line:
-                continue
-            surf = self.mid_font.render(line, True, (255, 200, 200))
-            self.screen.blit(surf, (cx - surf.get_width() // 2, cy + i * 40))
+        # ── Divider ─────────────────────────────────────────────────────
+        pygame.draw.line(self.screen, (180, 60, 60),
+                         (cx - 200, cy - 60), (cx + 200, cy - 60), 2)
 
-        # Đếm ngược
-        hint = self.hud2_small.render("Thoát sau 3 giây...", True, (160, 160, 160))
-        self.screen.blit(hint, (cx - hint.get_width() // 2, cy + 120))
+        # ── Điểm P1 (local player) ─────────────────────────────────────
+        p1_label = med_font.render(f"▲ {self.player_name}  (You)", True, (255, 255, 150))
+        p1_score = med_font.render(f"Score: {self.score}", True, (255, 255, 150))
+        self.screen.blit(p1_label, (cx - p1_label.get_width() // 2, cy - 45))
+        self.screen.blit(p1_score, (cx - p1_score.get_width() // 2, cy - 10))
+
+        # ── Divider nhỏ ─────────────────────────────────────────────────
+        pygame.draw.line(self.screen, (80, 120, 180),
+                         (cx - 160, cy + 28), (cx + 160, cy + 28), 1)
+
+        # ── Điểm P2 (partner) ──────────────────────────────────────────
+        pstate = self.client.get_partner_state()
+        p2_score_val = pstate.get("score", 0) if pstate else 0
+        p2_name = self.partner.name
+
+        p2_label = med_font.render(f"▲ {p2_name}  (Partner)", True, (160, 220, 255))
+        p2_score = med_font.render(f"Score: {p2_score_val}", True, (160, 220, 255))
+        self.screen.blit(p2_label, (cx - p2_label.get_width() // 2, cy + 38))
+        self.screen.blit(p2_score, (cx - p2_score.get_width() // 2, cy + 72))
+
+        # ── Tổng điểm chung ─────────────────────────────────────────────
+        pygame.draw.line(self.screen, (180, 180, 180),
+                         (cx - 200, cy + 108), (cx + 200, cy + 108), 2)
+        total = self.score + p2_score_val
+        total_surf = med_font.render(f"Total Team Score: {total}", True, (255, 220, 100))
+        self.screen.blit(total_surf, (cx - total_surf.get_width() // 2, cy + 116))
+
+        # ── Hint thoát ──────────────────────────────────────────────────
+        hint = sml_font.render("Thoát sau 3 giây...", True, (140, 140, 140))
+        self.screen.blit(hint, (cx - hint.get_width() // 2, cy + 160))
 
     # ─────────────────────────────────────────────────────
     # Helpers (delegate to GameScreen methods)
     # ─────────────────────────────────────────────────────
+
+    def _spawn_local_damage_text(self, amount: int, world_x: float, world_y: float):
+        """Tạo damage text cho local player (đỏ) và gửi event sang partner để hiển thị bên kia."""
+        dt = DamageText(amount, world_x, world_y, self.ui_font)
+        self.damage_text_group.add(dt)
+        # Gửi event để máy partner cũng hiển thị damage text tại vị trí này
+        self.client.send_event("player_damaged", {
+            "amount": amount,
+            "x": float(world_x),
+            "y": float(world_y),
+        })
 
     def _check_player_enemy_collision(self):
         if self.damage_cooldown > 0:
@@ -919,17 +1032,23 @@ class OnlineGameScreen(GameScreen):
         dmg = 0
         for skel in self.skeleton_group:
             if player_rect.colliderect(skel.rect):
-                dmg = 20
+                dmg = 5
                 break
         for boss in self.boss_group:
             if player_rect.colliderect(boss.rect):
-                dmg = 30
+                dmg = 10
                 break
         if dmg:
             self.health = max(0, self.health - dmg)
             self.damage_cooldown = self.damage_cooldown_time
             if self.damage_sound:
                 self.damage_sound.play()
+            # Hiện damage text ngay + đồng bộ sang partner
+            self._spawn_local_damage_text(
+                dmg,
+                self.player_x + self.player_w // 2,
+                self.player_y,
+            )
             self._send_my_state()
             if self.health <= 0:
                 self.client.send_event("died")
@@ -1008,10 +1127,15 @@ class OnlineGameScreen(GameScreen):
                 try:
                     gid = self.tmx_data.get_tile_gid(col, row, self.layer_index)
                     if gid in self.lava_gids:
-                        self.health = max(0, self.health - 10)
+                        self.health = max(0, self.health - 3)
                         self.lava_damage_cooldown = self.lava_damage_interval
                         if self.lava_sound:
                             self.lava_sound.play()
+                        self._spawn_local_damage_text(
+                            3,
+                            self.player_x + self.player_w // 2,
+                            self.player_y,
+                        )
                         self._send_my_state()
                         if self.health <= 0:
                             self.client.send_event("died")
@@ -1026,11 +1150,16 @@ class OnlineGameScreen(GameScreen):
         player_rect = pygame.Rect(int(self.player_x), int(self.player_y), self.player_w, self.player_h)
         for bullet in list(self.bullet_group):
             if player_rect.colliderect(bullet.rect):
-                self.health = max(0, self.health - 15)
+                self.health = max(0, self.health - 5)
                 self.damage_cooldown = self.damage_cooldown_time
                 bullet.kill()
                 if self.damage_sound:
                     self.damage_sound.play()
+                self._spawn_local_damage_text(
+                    5,
+                    self.player_x + self.player_w // 2,
+                    self.player_y,
+                )
                 self._send_my_state()
                 break
 

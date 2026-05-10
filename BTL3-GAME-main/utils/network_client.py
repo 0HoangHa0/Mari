@@ -66,10 +66,13 @@ class NetworkClient:
 
         # Ping/pong keepalive
         self._last_ping = 0.0
-        self._ping_interval = 20.0   # giây
+        self._ping_interval = 5.0   # giây - gửi ping thường xuyên hơn để tránh ngrok cắt kết nối
 
         # Checkpoint state
         self.checkpoint_status: dict = {}   # {checkpoint_id: {"p0": bool, "p1": bool, "unlocked": bool}}
+
+        # Thời điểm nhận state/event từ partner lần cuối (cho timeout detection)
+        self._last_partner_recv: float = time.time()
 
     # ─────────────────────────────────────────
     # Public API (gọi từ game thread)
@@ -132,6 +135,11 @@ class NetworkClient:
             except queue.Empty:
                 break
         return events
+
+    def get_partner_last_recv(self) -> float:
+        """Thời điểm nhận data từ partner lần cuối (thread-safe)."""
+        with self._state_lock:
+            return self._last_partner_recv
 
     def is_ready(self) -> bool:
         """True khi cả 2 người đã vào phòng."""
@@ -225,8 +233,13 @@ class NetworkClient:
         elif msg_type == "partner_state":
             with self._state_lock:
                 self._partner_state = {k: v for k, v in msg.items() if k != "type"}
+                # Đánh dấu thời điểm nhận để tránh false disconnect
+                self._last_partner_recv = time.time()
 
         elif msg_type == "partner_event":
+            # Bất kỳ event nào từ partner cũng coi là "còn kết nối"
+            with self._state_lock:
+                self._last_partner_recv = time.time()
             self._incoming_events.put(msg)
 
         elif msg_type == "checkpoint_status":
