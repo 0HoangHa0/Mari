@@ -21,7 +21,7 @@ from utils.assets import safe_load_image, resource_path
 
 
 # ─── Hằng số ───────────────────────────────────────────────────────────────
-SEND_INTERVAL = 1          # Gửi state mỗi frame (60fps = 60 lần/giây, đồng bộ nhanh nhất)
+SEND_INTERVAL = 0.5    # Gửi state mỗi frame (60fps = 60 lần/giây, đồng bộ nhanh nhất)
 CHECKPOINT_RADIUS = 48     # Pixel radius quanh checkpoint trigger
 MAP_ADVANCE_TILES  = 20    # Số tile map mở rộng thêm mỗi lần unlock
 PARTNER_ALPHA      = 200   # Độ mờ của sprite partner
@@ -632,7 +632,11 @@ class OnlineGameScreen(GameScreen):
                     self._advance_map(cid)
                 elif event_name == "partner_disconnected":
                     self.partner_disconnected = True
-                    self._add_notification("⚠ Partner đã ngắt kết nối!", (255, 80, 80), ttl=600)
+                    self._add_notification("Partner đã ngắt kết nối!", (255, 80, 80), ttl=600)
+                elif event_name == "died":
+                    # Server notified that one player died — end the game for both
+                    self._game_over = True
+                    self._game_over_reason = " Đồng đội đã chết! GAME OVER"
 
             elif ev_type == "partner_event":
                 pev = ev.get("event", "")
@@ -654,7 +658,7 @@ class OnlineGameScreen(GameScreen):
 
                 elif pev == "collect_coin":
                     self._remove_nearest_object(self.coin_group, data.get("x", 0), data.get("y", 0))
-                    self._add_notification(f"🪙 {self.partner.name} nhặt xu!", (255, 230, 100))
+                    self._add_notification(f" {self.partner.name} nhặt xu!", (255, 230, 100))
 
                 elif pev == "collect_sword":
                     # Partner nhặt kiếm → chỉ xóa sprite khỏi màn hình,
@@ -700,7 +704,9 @@ class OnlineGameScreen(GameScreen):
                     self._add_notification(f"{self.partner.name} tiêu diệt quái!", (255, 200, 60))
 
                 elif pev == "died":
+                    # Partner reported death — trigger shared game over
                     self._game_over = True
+                    self._game_over_reason = f" {self.partner.name} died! GAME OVER"
 
             elif ev_type == "partner_joined":
                 pname = ev.get("name", "Partner")

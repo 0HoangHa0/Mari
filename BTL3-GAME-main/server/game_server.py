@@ -236,11 +236,23 @@ class GameServer:
                         continue
                     event_name = msg.get("event", "")
                     data = msg.get("data", {})
-                    await room.broadcast_except(player.player_id, {
-                        "type": "partner_event",
-                        "event": event_name,
-                        "data": data,
-                    })
+                    
+                    # Handle "died" event: broadcast to both players as game_event
+                    if event_name == "died":
+                        died_msg = {
+                            "type": "game_event",
+                            "event": "died",
+                            "data": {"player_id": player.player_id},
+                        }
+                        await room.broadcast_all(died_msg)
+                        log.info(f"Room {room.room_id}: Player {player.player_id} ({player.name}) died!")
+                    else:
+                        # For other events, send to partner as partner_event
+                        await room.broadcast_except(player.player_id, {
+                            "type": "partner_event",
+                            "event": event_name,
+                            "data": data,
+                        })
 
                 # ── PING ──────────────────────────────────────────────
                 elif msg_type == "ping":
